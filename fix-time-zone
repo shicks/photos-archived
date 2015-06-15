@@ -1,0 +1,56 @@
+#!/usr/bin/perl
+
+use strict;
+use Time::Local;
+
+sub exif_utc {
+  local $_;
+  print STDERR "exiftool \"$_[0]\" 2>/dev/null |\n";
+  open EXIF, "exiftool \"$_[0]\" 2>/dev/null |";
+  my $offset = 0;
+  my $time = 0;
+  my $gpstime = 0;
+  while ($_ = <EXIF>) {
+    if (/^Time Zone\s*:\s*(-?)(\d+):(\d+)/
+        or /^File Modification Date\/Time\s*:\s*[0-9: ]*([-+]?)(\d+):(\d+)/) {
+      $offset = ($1 eq '-' ? -1 : 1) * (3600 * $2 + 60 * $3);
+      #print STDERR "GOT TIME ZONE: $offset\n";
+    } elsif (/^(?:Date\/Time Original|Create Date)\s*:\s*(\d+):(\d+):(\d+) (\d+):(\d+):(\d+)/) {
+      $time = timegm($6, $5, $4, $3, $2-1, $1-1900);
+      #print STDERR "GOT TIME: $time\n";
+    } elsif (/^(?:GPS Date\/Time)\s*:\s*(\d+):(\d+):(\d+) (\d+):(\d+):(\d+)/) {
+      $gpstime = timegm($6, $5, $4, $3, $2-1, $1-1900);
+      #print STDERR "GOT GPS TIME: $time\n";
+    }
+  }
+  close EXIF;
+  return $gpstime if $gpstime;
+  if ($time == 0 and $offset == 0) { # alternate date embedded in filename
+    if ($_[0] =~ /(201\d)-?(\d\d)-?(\d\d)[_T -]?(\d\d)[-:]?(\d\d)[-:]?(\d\d)/) {
+      # assume local timezone for this...
+      $time = timelocal($6, $5, $4, $3, $2-1, $1-1900);
+    }
+  }
+  if ($time == 0) {
+    print "time=0 => $_[0]\n";
+    return 0;
+  }
+  #print "TIME=$time, OFFSET=$offset => " . ($time - $offset) . "\n";
+  return $time - $offset;
+}
+
+while (my $dir = shift) {
+  opendir DIR, $dir;
+  while (my $file = readdir DIR) {
+    next if $file =~ /^\./;
+    my $time = exif_utc("$dir/$file");
+    if ($time > 1425808800 and $time < 1427000000) {
+      # mar 8 2015 = PDT, fixed mar 21 17:00
+      # TODO - figure out how to fix both TimeZone AND DateTimeOrig
+      #system "exiftool", "-TimeZone=-07:00", "-DaylightSavings=On", "$dir/$file";
+      
+      #unlink "$dir/${file}_original";
+    }
+  }
+  close DIR;
+}

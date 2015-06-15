@@ -1,0 +1,426 @@
+#!/usr/bin/perl
+
+# Usage: import [path|device]
+# Imports *new* photos from the given path/device.
+# Uses ~/photo/manage/db as a database to keep track of what's been seen already
+#   - size/filename is all that is used
+# Photos are pulled into ~/photo/manage/incoming
+#
+# Flags:
+#   --fixdate | --offset=[seconds]   fix DateTime field
+#   --process | --process=nogeotag   don't import, just process
+# Order matters for now.
+
+# Geocoding:
+#   - if imported files don't have any GPS location, assume time is PST
+#   - scan imported files, find date range (convert to UTC)
+#   - scan ~/Downloads/*.kml - store in set
+#   - display link https://maps.google.com/locationhistory/b/0/kml?
+#                               startTime=[startMs]&endTime=[endMs]
+#   - find a new files in ~/Downloads/*.kml  -> xml
+#   - use it to geocode the photos and correct their timezones
+#   - wget -O /dev/sdvout 'https://maps.googleapis.com/maps/api/timezone/json?
+#                                   location=[lat],[long]&timestamp=[timeSec]'
+#      - limit: 5 calls per second... need to cluster requests
+#   - provides timezone as a function of PST time
+#   - interpolate times, add data to exif
+#      - require a point w/in 5 minutes to actually add exif
+#      - find some custom way to mark that the timezone has been corrected?
+#        (possible UserComment?)
+# Once all files have corrected timestamps, add UTC prefix...
+# Removing all GPS tags: exiftool -gps:all= *.jpg
+
+# TZLog:
+#   - the tzlog file stores a list of time zones
+#   - the format is Exemplar_City Time String, and indicates transitions
+#   - all times after each line (in local time) are in the last zone
+#   - heading: [CAMERA] indicates what TZ the camera was in
+
+
+# TODO - be more careful about which photos get re-tagged,etc
+#      - be more efficient about issueing exiftool commands
+#      - symlinks in directory to only geotag some pictures, etc
+
+# TODO --- don't follow symlinks in source dir, esp if same file!!!!!!
+# TODO --- perl class for a picture, with all the exif data
+#          queue up changes, then commit them all at once
+#          parallelize?!??!?
+#          separate linktrees for geotagging - one per person
+#      --- may also need to break it up into 1-month chunks?
+
+# --- move this logic to a smaller computer?!?
+
+use strict;
+use File::Temp qw/tempfile/;
+use Time::Local;
+
+my $default_offset = undef;
+my $dir = `dirname \$(readlink -f "$0")`; chomp $dir;
+my $dest_dir = "$dir/" . time;
+my $db = "$dir/db";
+my $EMPTY_MD5 = 'd41d8cd98f00b204e9800998ecf8427e';
+my $GPICSYNC = "$ENV{'HOME'}/Downloads/gpicsync/gpicsync.py";
+my $geotag = 1;
+my $correct_date = 1; # TODO(sdh): change default to 0 if causes problems
+
+my $kml_file = `tempfile -s .kml`; chomp $kml_file;
+my $gpx_file = `tempfile -s .gpx`; chomp $gpx_file;
+my $cookies_file = `tempfile -s .txt`; chomp $cookies_file;
+
+my @tzlog = (); # format: "epoch_sec zone"
+my %camera_tz = ();
+my $curr_camera = '';
+open TZ, "$dir/tzlog";
+while ($_ = <TZ>) {
+  s/\s*#.*//;
+  $curr_camera = $1 if s/^\[([^]]+)\]//g;
+  next unless /\S/;
+  my @split = split /\s+/, $_, 2;
+  my $tz = $split[0];
+  my $epoch = `TZ="$tz" date --date='$split[1]' +\%s`;
+  chomp $epoch;
+  if ($curr_camera) {
+    push @{$camera_tz{$curr_camera}}, "$epoch $tz";
+  }
+  push @tzlog, "$epoch $tz";
+}
+close TZ;
+
+if ($ARGV[0] =~ /--offset=(\d+)/) {
+  $default_offset = $1;
+  $correct_date = 1;
+  shift;
+} elsif ($ARGV[0] =~ /--fixdate/) {
+  $correct_date = 1;
+  shift;
+}
+
+sub run {
+  print STDERR "@_\n";
+  system @_;
+}
+
+# Given epoch_time returns exif-compatible time setter
+# e.g.  -DateTimeOriginal=... -TimeZone=... -TimeZoneCity=...
+sub get_localtime {
+  my $epoch = shift;
+  my $tz = '';
+  foreach (@tzlog) {
+    /(\d+) (\S+)/ or die "Could not parse tzlog line: $_";
+    last if $1 > $epoch;
+    $tz = $2;
+  }
+  my $datetime = `TZ='$tz' date --date=\@'$epoch' +'%Y:%m:%d %H:%M:%S'`;
+  chomp $datetime;
+  my $timezone = `TZ='$tz' date --date=\@'$epoch' +'%:z'`;
+  chomp $timezone;
+  # TimeZone and TimeZoneCity
+  #my $city = $tz;
+  #$city =~ s/_/ /g;
+  #$city =~ s|^.*/||g;
+  my @out = (
+          "-DateTimeOriginal=$datetime",
+          "-xmp:dateTimeOriginal=$datetime$timezone");
+  return @out;
+}
+
+# Given (camera, epoch_time) returns the offset
+sub get_offset {
+  my ($camera, $epoch) = @_;
+  foreach (keys %camera_tz) {
+    if ($camera =~ /$_/) {
+      #print "FOUND CAMERA: $camera vs $_\n";
+      my @tzs = @{$camera_tz{$_}};
+      my $tz = '';
+      foreach (@tzs) {
+        /(\d+) (\S+)/ or die "Could not parse tzlog line: $_";
+        last if $1 > $epoch;
+        $tz = $2;
+      }
+      my $offset = `TZ='$tz' date --date=\@$epoch +\%z`;
+      $offset =~ /([+-]?)(\d\d)(\d\d)/ or die "Bad offset: $offset";
+      return ($1 eq '-' and -1 or 1) * ($2 * 3600 + $3 * 60);
+    }
+  }
+  return $default_offset or 0;
+}
+
+my %file_types = (
+  'jpg' => 'image',
+  'cr2' => 'raw',
+  'mov' => 'video',
+  'mts' => 'video',
+  'mp4' => 'video');
+
+################
+
+sub init_db {
+  system "sqlite3 $db 'create table seen(file varchar(255), size integer);' >/dev/null 2>/dev/null";
+}
+
+# Arguments: file, size
+sub touch_db {
+  system "sqlite3 $db 'insert into seen values(\"$_[0]\", $_[1]);' >/dev/null 2>/dev/null";
+}
+
+# Arguments: file, size
+# Return: boolean whether it is present
+sub check_db {
+  my $out = `sqlite3 $db 'select * from seen where file = "$_[0]" and size = $_[1];'`;
+  return $out =~ /\S/;
+}
+
+################
+
+# Argument: either (1) a path, or (2) android://[optional id][/path]
+# Performs the import
+sub import {
+  my $path = $_[0];
+  if ($path =~ s|^android://||g) {
+    import_android($path);
+  } else {
+    import_dir($path);
+  }
+}
+
+# Returns the md5sum of a path as a string
+sub md5sum {
+  local($_) = $_[0];
+  my $md5;
+  if (s|^android://([^/]*)||) {
+    my $dev = '';
+    $dev = "-s $1" if $1;
+    $md5 = `adb $dev shell md5 "$_"`;
+  } else {
+    #print STDERR "md5sum $_\n";
+    $md5 = `md5sum "$_"`;
+  }
+  chomp $md5;
+  $md5 =~ s/$_// or die "Bad result for md5: [$md5]";
+  $md5 =~ s/\s+//g;
+  return $md5;
+}
+
+sub import_android {
+  local ($_) = $_[0];
+  (my $devpath = $_) =~ s|/.*||;
+  my $dev = '';
+  (my $path = $_) =~ s|[^/]*/||;
+  $path = "./$path" if $path;
+  $dev = "-s $devpath" if $devpath;
+  open ADB, "adb shell $dev 'cd sdcard/; ls -Rl \"$path\"'|";
+  my $dir = '';
+  while ($_ = <ADB>) {
+    chomp $_;
+    s/[\r\n]$//;
+    $dir = $1 if m|^\./(.*):\s*$|;
+    if (/^[-d]\S+\s+\S+\s+\S+\s+(\d+)\s+\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}\s+(.+)/) {
+      my $size = $1;
+      my $base = $2;
+      (my $ext = $base) =~ s/.*\.//; $ext = lc $ext;
+      print STDERR "dir: $dir, size: $size, base: $base, ext: $ext\n";
+      if ($file_types{$ext} and !check_db($base, $size)) {
+        my $file = "$dest_dir/" . lc($base);
+        my $orig_md5 = md5sum "android://$devpath/sdcard/$dir/$base";
+        die "Could not checksum file $_" if $orig_md5 =~ /$EMPTY_MD5/;
+        if (-e $file) {
+          my $clobber_md5 = md5sum $file;
+          (my $clobber_name = $file) =~ s/\./_$clobber_md5./;
+          rename $file, $clobber_name;
+          $file =~ s/\./_$orig_md5/;
+        }
+        my @dev = ();
+        @dev = ('-s', $devpath) if $devpath;
+        system "adb", @dev, "pull", "/sdcard/$dir/$base", $file;
+        my $new_md5 = md5sum $file;
+        die "Bad copy $_ to $file" if $orig_md5 ne $new_md5;
+        touch_db($base, $size);
+      }
+    }
+  }
+  close ADB;
+}
+
+# Recursively scan the directories
+sub import_dir {
+  local $_;
+  my $dir = $_[0];
+  my @files = ();
+  opendir DIR, $dir;
+  while ($_ = readdir DIR) {
+    push @files, $_ unless /^\.\.?$/ or -l "$dir/$_";
+  }
+  closedir DIR;
+  foreach (@files) {
+    (my $ext = $_) =~ s/.*\.//; $ext = lc $ext;
+    my $base = $_;
+    $_ = "$dir/$base";
+    if (-d $_) {
+      import_dir($_);
+    } elsif ($file_types{$ext}) {
+      my $size = -s $_;
+      if (!check_db($base, $size)) {
+        # Just go directly to the destination - no extra moving...
+        my $file = "$dest_dir/" . lc($base);
+        my $orig_md5 = md5sum $_;
+        die "Could not checksum file $_" if $orig_md5 =~ /$EMPTY_MD5/;
+        if (-e $file) {
+          my $clobber_md5 = md5sum $file;
+          (my $clobber_name = $file) =~ s/\./_$clobber_md5./;
+          rename $file, $clobber_name;
+          $file =~ s/\./_$orig_md5/;
+        }
+        system "cp", "$_", $file;
+        my $new_md5 = md5sum $file;
+        die "Bad copy $_ to $file" if $orig_md5 ne $new_md5;
+        touch_db($base, $size);
+
+        # TEMP - fix the time zone
+        my $time = exif_utc($file);
+        #if ($time < 1424772771) { # only older files
+        #  system "exiftool", "-TimeZone=-08:00", "-DaylightSavings=Off", $file;
+        #  unlink "${file}_original";
+        #} elsif ($time > 1425808800 and $time < 1426700000) {
+        #  # mar 8 2015 = PDT, fixed mar 21 17:00
+        #  system "exiftool", "-TimeZone=-07:00", "-DaylightSavings=On", $file;
+        #  unlink "${file}_original";
+        #}
+      }
+    }
+  }
+}
+
+# Finds the UTC timestamp of $_[0]
+sub exif_utc {
+  local $_;
+  print STDERR "exiftool -xmp:dateTimeOriginal -all \"$_[0]\" 2>/dev/null |\n";
+  open EXIF, "exiftool -xmp:dateTimeOriginal -all \"$_[0]\" 2>/dev/null |";
+  my $offset = $default_offset or 0;
+  my $offset_from_zone = defined $default_offset;
+  my $time = 0;
+  my $gpstime = 0;
+  my $camera = '';
+  while ($_ = <EXIF>) {
+    if (/^Camera Model Name\s*:\s*(.*)/) {
+      $camera = $1;
+    }
+    if (/^Time Zone\s*:\s*(-?)(\d+):(\d+)/
+        or /^Date\/Time Original\s*:\s*[0-9: ]{19}([-+]?)(\d+):(\d+)/
+        or (/^File Modification Date\/Time\s*:\s*[0-9: ]*([-+]?)(\d+):(\d+)/
+            and not $offset_from_zone)) { # TimeZone takes precedence over File
+      $offset = ($1 eq '-' ? -1 : 1) * (3600 * $2 + 60 * $3);
+      #print STDERR "setting offset $offset from $_\n";
+      $offset_from_zone = /Original/ or /Time Zone/;
+      #print STDERR "GOT TIME ZONE: $offset\n";
+    } elsif (/^(Date\/Time Original|Create Date)\s*:\s*(\d+):(\d+):(\d+) (\d+):(\d+):(\d+)/) {
+      $time = timegm($7, $6, $5, $4, $3-1, $2-1900)
+        unless $1 eq 'Create Date' and $time; # DateTimeOrig takes precedence
+      #print STDERR "GOT TIME: $time\n";
+    } elsif (/^(?:GPS Date\/Time)\s*:\s*(\d+):(\d+):(\d+) (\d+):(\d+):(\d+)/) {
+      $gpstime = timegm($6, $5, $4, $3, $2-1, $1-1900);
+      #print STDERR "GOT GPS TIME: $time\n";
+    }
+  }
+  close EXIF;
+  return $gpstime if $gpstime;
+  if ($time == 0) {# and $offset == 0) { # alternate date embedded in filename
+    if ($_[0] =~ /(201\d)-?(\d\d)-?(\d\d)[_T -]?(\d\d)[-:]?(\d\d)[-:]?(\d\d)/) {
+      # assume local timezone for this...
+      $time = timelocal($6, $5, $4, $3, $2-1, $1-1900);
+      my $cmd="exiftool -DateTimeOriginal='$1:$2:$3 $4:$5:$6' \"$_[0]\"";
+      print "$cmd\n";
+      system "$cmd";
+    }
+  } else {
+    if (not $offset_from_zone) {
+      print "NO OFFSET FROM ZONE\n";
+      $offset = get_offset($camera, $time);
+    }
+  }
+  if ($time == 0) {
+    print "time=0 => $_[0]\n";
+    return 0;
+  }
+  #print "TIME=$time, OFFSET=$offset => " . ($time - $offset) . "\n";
+  return $time - $offset;
+}
+
+# Goes through all the imported files and processes/renames them
+sub process {
+  local $_;
+  opendir DIR, $dest_dir;
+  my @files = ();
+  while ($_ = readdir DIR) {
+    push @files, $_ unless /^\.\.?$/;
+  }
+  closedir DIR;
+  my $min = time;
+  my $max = 0;
+  my $gps = 0;
+  # TODO(sdh): do an initial pass and find time range,
+  #   request location history, geotag all the photos
+  foreach (@files) {
+    mkdir "$dest_dir/gps";
+    my $utc = exif_utc("$dest_dir/$_");
+    if ($correct_date) {
+      my @datetime = get_localtime($utc);
+      #system "exiftool", @datetime, "$dest_dir/$_";
+    }
+    my $exifgps = `exiftool "$dest_dir/$_" | grep 'GPS Longitude'`;
+    next unless $utc;
+    # prepend the timestamp
+    unless (/^${utc}_/) {
+      print "$dest_dir/$_ => $dest_dir/${utc}_$_\n";
+      rename "$dest_dir/$_", "$dest_dir/${utc}_$_";
+    }
+    if ($exifgps !~ /[EW]/) {
+      $min = $utc < $min ? $utc : $min;
+      $max = $utc > $max ? $utc : $max;
+      $gps = 1;
+      # Note: gpicsync can't handle symlinks...!
+      system "mv $dest_dir/$_ $dest_dir/gps";
+    }
+  }
+
+  # We don't need human intervention here - just swipe the cookies from
+  # Chrome's cookie jar...? - see chrome-cookie.py w/ domain='google.com'
+  #  - figure out proper format for wget/curl
+
+  if ($max > $min and $gps and $geotag) {
+    $min -= 600;
+    $max += 600;
+
+    unlink $gpx_file; unlink $kml_file; unlink $cookies_file;
+    run "python chrome-cookies.py > $cookies_file";
+    run "curl --cookie $cookies_file -o $kml_file 'https://maps.google.com/locationhistory/b/0/kml?startTime=${min}000&endTime=${max}000'";
+    run "$dir/kml2gpx < $kml_file > $gpx_file";
+
+#    print <<EOF;
+#Please click the following link and save to /tmp/track.kml
+#https://maps.google.com/locationhistory/b/0/kml?startTime=${min}000&endTime=${max}000
+#EOF
+    #sleep 1 while !-e "/tmp/track.kml";
+    # gpsbabel doesn't work - we've got simple enough XML data - just
+    # munge it by hand - each pair of lines ends up with a <trkpt>
+    #system "gpsbabel -i kml -f /tmp/track.kml -o gpx -F /tmp/track.gpx";
+    run "python $GPICSYNC -d $dest_dir/gps -g $gpx_file";
+    #run "mv $dest_dir/gps/* $dest_dir/";
+    run "rm $dest_dir/*_original"; # how to remove?
+    #run "rmdir gps";
+  }
+}
+
+# Do stuff...
+
+if ($ARGV[0] !~ /--process\b/) {
+  system "mkdir -p $dest_dir";
+  init_db;
+  while ($_ = shift) {
+    import $_;
+  }
+} else {
+  $geotag = 0 if $ARGV[0] =~ /\bnogeotag\b/; # --process=nogeotag
+  $dest_dir = $ARGV[1];
+}
+process;
+

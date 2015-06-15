@@ -1,0 +1,43 @@
+#!/usr/bin/perl
+
+use strict;
+
+while (my $dir = shift) {
+  opendir DIR, $dir;
+  while (my $file = readdir DIR) {
+    next if $file =~ /^\./;
+    open EXIF, "exiftool '$dir/$file' |";
+    my $ap = '1.4';
+    my $rok = 0;
+    while ($_ = <EXIF>) {
+      chomp $_;
+      if (/Lens Info\s+:\s+(.*)/) {
+        my $lens = $1;
+        if ($lens =~ /^(?:35-80mm|1-65535mm|0mm)/) {
+          $rok = 1;
+        }
+      }
+      if (/Aperture\ Value\s+:\s+(\d+\.?\d+?)/) {
+        $ap = $1;
+      }
+    }
+    close EXIF;
+    if ($rok) { # Correct the various settings
+      my @args = ("-FNumber=$ap",
+                  "-ApertureValue=$ap",
+                  "-FocalLength=85 mm",
+                  "-MaxFocalLength=85 mm",
+                  "-MinFocalLength=85 mm",
+                  "-MaxAperture=1.4",
+                  "-MinAperture=22",
+                  "-LensInfo=85mm f/1.4",
+                  "-LensModel=Rokinon 85mm f/1.4",
+                  "-LensSerialNumber=E213I4341",
+                  "-Lens=85.0 mm",
+                 );
+      system "exiftool", @args, "$dir/$file";
+      unlink "$dir/${file}_original";
+    }
+  }
+  close DIR;
+}

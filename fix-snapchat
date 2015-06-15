@@ -1,0 +1,75 @@
+#!/usr/bin/perl
+
+# Usage: ../fix-snapchat (from directory)
+
+mkdir 'snap' or die "directory 'snap' already exists";
+system <<EOF;
+for a in *.jpg; do
+  if ! exiftool -DateTimeOriginal \$a 2>/dev/null | grep -q Date; then
+    ln -s ../\$a snap/\$a
+  fi
+done
+EOF
+
+# Get the hashes
+open MATCHES, 'image_matcher.py snap |';
+my %files = ();
+my @matches = ();
+while ($_ = <MATCHES>) {
+  m|snap/(\S+) snap/(\S+) (\d+)| or die "Could not parse line: $_";
+  last if $3 > 10;
+  push @matches, "$1 $2";
+}
+while (<MATCHES>) {}
+close MATCHES;
+opendir DIR, 'snap';
+while ($_ = readdir DIR) {
+  $files{$_} = 1 unless /^\./;
+}
+closedir DIR;
+system 'rm -rf snap';
+
+sub epoch {
+  return $1 if /\b(1[34]\d{8})(?:\d{3})?\b/;
+  if (/\bsnapchat-(201\d)(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)\.jpg/) {
+    my $out = `date --date='$1/$2/$3 $4:$5:$6Z' +\%s`;
+    chomp $out;
+    return $out;
+  }
+  return '';    
+}
+
+# Add exif tags to both images if one looks like [0-9]{13}
+# This timestamp is in *local* time, but we have no way of
+# knowing what the timezone actually is :-/.  Fortunately,
+# local time is what we typically want for the timestamp,
+# so it's not the end of the world.
+foreach (@matches) {
+  /(\S+) (\S+)/;
+  my ($a, $b) = ($1, $2);
+  my $epoch = epoch($_);
+  next unless $epoch;
+  my $fmt = '%Y:%m:%d %H:%M:%S';
+  my $date = `date --date=\@$epoch +'$fmt'`;
+  system "exiftool -DateTimeOriginal='$date' $a";
+  system "exiftool -DateTimeOriginal='$date' $b";
+  unlink "${a}_original";
+  unlink "${b}_original";
+  delete $files{$a};
+  delete $files{$b};
+}
+
+# Now deal with well-named files that have no match.
+foreach (keys %files) {
+  my $epoch = epoch($_);
+  next unless $epoch;
+  my $fmt = '%Y:%m:%d %H:%M:%S';
+  my $date = `date --date=\@$epoch +'$fmt'`;
+  system "exiftool -DateTimeOriginal='$date' $_";
+  unlink "${_}_original";
+}
+
+
+
+####
+# TODO(sdh): make tool to just use the name...?

@@ -1,0 +1,22 @@
+#!/usr/bin/perl
+
+# Usage: ../fix-timestamp-from-name FILE...
+
+sub epoch {
+  return $1 if /\b(1[34]\d{8})(?:\d{3})?(?:\b|_)/;
+  if (/\bsnapchat-(201\d)(\d\d)(\d\d)(\d\d)(\d\d)(\d\d)\.jpg/) {
+    my $out = `date --date='$1/$2/$3 $4:$5:$6Z' +\%s`;
+    chomp $out;
+    return $out;
+  }
+  return '';    
+}
+
+while ($_ = shift) {
+  my $epoch = epoch($_);
+  next unless $epoch;
+  my $fmt = '%Y:%m:%d %H:%M:%S';
+  my $date = `date --date=\@$epoch +'$fmt'`;
+  system "exiftool -DateTimeOriginal='$date' $_";
+  unlink "${_}_original";
+}

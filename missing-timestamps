@@ -1,0 +1,7 @@
+#!/bin/sh
+
+for a in *.jpg; do
+  if ! exiftool -DateTimeOriginal $a 2>/dev/null | grep -q Date; then
+    echo $a;
+  fi
+done

@@ -1,0 +1,33 @@
+America/Los_Angeles     Jan 10, 2010
+Asia/Hong_Kong          Jan 17, 2012
+Asia/Bangkok            Jan 18, 2012
+America/Los_Angeles     Jan 27, 2012
+Pacific/Honolulu        Apr 11, 2013
+America/Los_Angeles     Apr 18, 2013
+America/New_York        Sep 27, 2013
+America/Los_Angeles     Oct 7, 2013
+America/New_York        Oct 24, 2013
+America/Los_Angeles     Oct 31, 2013
+#America/Chicago         May 5, 2014
+#America/Los_Angeles     May 6, 2014
+America/New_York        July 24, 2014
+America/Denver          July 28, 2014
+America/Los_Angeles     July 30, 2014
+America/New_York        Sep 2, 2014
+America/Los_Angeles     Sep 8, 2014
+America/New_York        Dec 22, 2014
+America/Los_Angeles     Dec 26, 2014
+
+[T5i]
+PDT                     @0
+PST                     @1424772771
+PDT                     @1426700000
+
+[TX30]
+EST                     @0
+
+[TX20]
+UTC                     @0
+
+[TX5]
+UTC                     @0

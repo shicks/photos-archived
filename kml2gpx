@@ -1,0 +1,41 @@
+#!/usr/bin/perl
+
+use strict;
+
+# Finds the UTC timestamp of $_[0], reformats it as UTC for gpx
+sub kml_utc_gpx {
+  local($_) = shift;
+  if (/(\d{4})-(\d\d)(\d\d)T(\d\d):(\d\d):(\d\d).(\d\d\d)([+-])(\d\d):(\d\d)/) {
+    my $msec = $7;
+    my $time = timegm($6, $5, $4, $3, $2-1, $1-1900);
+    $time -= ($8 eq '-' ? -1 : +1) * ($9 * 3600 + $10 * 60); # remove offset
+    my ($sec, $min, $hour, $day, $mon, $yr) = gmtime $time;
+    $yr += 1900;
+    $mon += 1;
+    return "$yr-$mon-${day}T$hour:$min:$sec.${msec}Z";
+  }
+  return $_;
+}
+
+print <<EOF;
+<?xml version="1.0" standalone="yes"?>
+<gpx xmlns="http://www.topografix.com/GPX/1/1" version="1.1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd">
+<trk><number>1</number><trkseg>
+EOF
+
+my $time = '';
+my $index = 1;
+while (<>) {
+  $time = kml_utc_gpx($1) if m|<when>(.*)</when>|;
+  if (m|<gx:coord>(\S+)\s+(\S+)\s+\S+</gx:coord>|) {
+    my $lon = $1;
+    my $lat = $2;
+    print <<EOF;
+<trkpt lat="$lat" lon="$lon">
+  <ele>0</ele><time>$time</time><name>$index</name>
+</trkpt>
+EOF
+    $index++;
+  }
+}
+print "</trkseg></trk></gpx>\n";
